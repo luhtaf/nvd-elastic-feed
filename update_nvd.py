@@ -72,7 +72,7 @@ def get_time_range():
     return start_date, end_date
 
 template_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-template_index = "list-cve-new-<tahun>"
+template_index = "list-cve-<tahun>"
 es = Elasticsearch(url_elastic, verify_certs=False)
 
 def check_cve_exists(cve_id):

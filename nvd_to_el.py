@@ -25,7 +25,7 @@ def load_config():
 config = load_config()
 url_elastic = config.get('url_elastic', 'http://localhost:9200')
 template_url = "https://services.nvd.nist.gov/rest/json/cves/2.0?startIndex=<halaman>"
-template_index = "list-cve-new-<tahun>"
+template_index = "list-cve-<tahun>"
 es = Elasticsearch(url_elastic, verify_certs=False)
 
 def process_per_page(page, perPage=2000):

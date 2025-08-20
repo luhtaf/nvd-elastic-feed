@@ -50,7 +50,7 @@ def log_exception(e, filename="error_log.txt"):
         print(f"[Thread-{threading.current_thread().name}] [!] Exception di line {lineno}, lihat {filename}")
 
 template_url = "https://services.nvd.nist.gov/rest/json/cves/2.0?startIndex=<halaman>"
-template_index = "list-cve-new-<tahun>"
+template_index = "list-cve-<tahun>"
 es = Elasticsearch(url_elastic, verify_certs=False)
 
 def process_per_page(page, perPage=PER_PAGE):
