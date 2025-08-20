@@ -1,3 +1,4 @@
 config.yaml
 error_log.txt
 *.txt
+venv
