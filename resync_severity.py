@@ -1,8 +1,9 @@
 import sys
 import traceback
+import time
 from datetime import datetime
-from elasticsearch import Elasticsearch
-from elasticsearch.helpers import scan, bulk
+from elasticsearch import Elasticsearch, NotFoundError
+from elasticsearch.helpers import bulk
 from tqdm import tqdm
 
 def log_exception(e, cve_id, doc_id, filename="resync_error_log.txt"):
@@ -38,7 +39,7 @@ def get_cve_details(es_client, cve_id):
         # This is expected if the CVE is not in our list-cve index
         return None, None
     except Exception:
-        # For other unexpected errors, we also return None to be safe
+        # For other unexpected errors, we also return None to be safe.
         return None, None
 
 def main():
@@ -69,13 +70,13 @@ def main():
     url_elastic = "http://admin:admin123@10.12.20.213:9200"
     es = Elasticsearch(
         [url_elastic], 
-        verify_certs=False,
-        request_timeout=120,      # Increase timeout to 2 minutes
+        verify_certs=False, 
+        request_timeout=60,       # Back to 60s, as requests are smaller
         retry_on_timeout=True,    # Automatically retry on timeout
-        max_retries=5,            # Increase retries
+        max_retries=3,
         sniff_on_start=False,     # Disable sniffing on start
         sniff_on_connection_fail=False, # Disable sniffing on fail
-        sniffer_timeout=None      # Disable periodic sniffing
+        sniffer_timeout=None
     )
 
     print(f"[*] Starting resync process...")
@@ -114,21 +115,14 @@ def main():
     current_from = 0
 
     try:
-        # First, get the total count to set up the progress bar
-        print("[*] Counting total documents to process...")
-        count_response = es.count(index=index_pattern, body=query)
-        total_docs = count_response['count']
-        print(f"[*] Found {total_docs} documents to process.")
-
-        if total_docs == 0:
-            print("[*] No documents found. Exiting.")
-            sys.exit(0)
-
-        with tqdm(total=total_docs, desc="Processing documents", unit=" docs") as pbar:
-            while current_from < total_docs:
+        print("[*] Starting to process documents page by page...")
+        with tqdm(desc="Processing documents", unit=" docs") as pbar:
+            while True: # Loop indefinitely until no more documents are found
                 # Fetch one page of results
                 try:
                     search_response = es.search(
+                        # Using track_total_hits=False is more efficient when we don't need an exact total
+                        track_total_hits=False, 
                         index=index_pattern,
                         body=query,
                         from_=current_from,
@@ -142,9 +136,10 @@ def main():
 
                 hits = search_response['hits']['hits']
                 if not hits:
-                    # Should not happen if total_docs > 0, but as a safeguard
+                    # No more documents found, we are done.
                     break
 
+                actions_for_bulk = []
                 for doc in hits:
                     try:
                         doc_id = doc['_id']
@@ -160,9 +155,16 @@ def main():
                         if new_score is not None and new_severity is not None:
                             if (doc['_source'].get('Score') != new_score or
                                 doc['_source'].get('Severity') != new_severity):
-                                # Update document one by one
-                                es.update(index=index_name, id=doc_id, body={"doc": {"Score": new_score, "Severity": new_severity}})
-                                updated_count += 1
+                                # Prepare action for bulk update
+                                actions_for_bulk.append({
+                                    "_op_type": "update",
+                                    "_index": index_name,
+                                    "_id": doc_id,
+                                    "doc": {
+                                        "Score": new_score,
+                                        "Severity": new_severity
+                                    }
+                                })
                             else:
                                 skipped_count += 1  # Already up-to-date
                         else:
@@ -176,7 +178,20 @@ def main():
 
                 current_from += len(hits)
 
+                # Perform bulk update for the current page if there are actions
+                if actions_for_bulk:
+                    try:
+                        success, _ = bulk(es, actions_for_bulk, raise_on_error=True)
+                        updated_count += success
+                    except Exception as e:
+                        print(f"\n[!] Bulk update for page failed. See log for details. Error: {e}")
+                        # Log each failed action
+                        for action in actions_for_bulk:
+                            log_exception(e, action.get('doc', {}).get('Vuln', 'N/A'), action.get('_id', 'N/A'))
+                            error_count += 1
+
     except Exception as e:
+        # This will catch the initial ConnectionError if it happens on the first search
         print(f"\n[!] An unexpected error occurred: {e}")
         traceback.print_exc()
 
