@@ -14,6 +14,7 @@ def log_exception(e, cve_id, doc_id, filename="resync_error_log.txt"):
         f.write(tb_str)
         f.write("\n\n")
 
+
 def get_cve_details(es_client, cve_id):
     """
     Fetches score and severity for a given CVE ID from the list-cve-* indices.
@@ -33,8 +34,11 @@ def get_cve_details(es_client, cve_id):
         severity = response['_source'].get('sev')
         
         return score, severity
+    except NotFoundError:
+        # This is expected if the CVE is not in our list-cve index
+        return None, None
     except Exception:
-        # Could be NotFoundError or other issues, we can ignore these
+        # For other unexpected errors, we also return None to be safe
         return None, None
 
 def main():
@@ -103,75 +107,74 @@ def main():
     }
 
     # --- Processing ---
-    actions = []
     updated_count = 0
     skipped_count = 0
     error_count = 0
+    page_size = 10  # Process 10 documents at a time (very small)
+    current_from = 0
 
     try:
-        print("[*] Scanning for documents to process... (Total count is omitted for stability)")
-        # Process documents with a progress bar
-        # We don't know the total, so the progress bar will show iteration count
-        with tqdm(desc="Processing documents", unit=" docs") as pbar:
-            # Use scan with smaller batch size and longer scroll time for stability
-            for doc in scan(
-                client=es, 
-                index=index_pattern, 
-                query=query, 
-                size=50,      # Further reduce batch size
-                scroll='10m'  # Keep the scroll context alive for 10 minutes
-            ):
+        # First, get the total count to set up the progress bar
+        print("[*] Counting total documents to process...")
+        count_response = es.count(index=index_pattern, body=query)
+        total_docs = count_response['count']
+        print(f"[*] Found {total_docs} documents to process.")
+
+        if total_docs == 0:
+            print("[*] No documents found. Exiting.")
+            sys.exit(0)
+
+        with tqdm(total=total_docs, desc="Processing documents", unit=" docs") as pbar:
+            while current_from < total_docs:
+                # Fetch one page of results
                 try:
-                    doc_id = doc['_id']
-                    index_name = doc['_index']
-                    cve_id = doc['_source'].get('Vuln')
-
-                    if not cve_id:
-                        skipped_count += 1
-                        pbar.update(1)
-                        continue
-
-                    # Fetch the correct score and severity
-                    new_score, new_severity = get_cve_details(es, cve_id)
-
-                    # If new data is found and it's different, prepare an update action
-                    if new_score is not None and new_severity is not None:
-                        if (doc['_source'].get('Score') != new_score or 
-                            doc['_source'].get('Severity') != new_severity):
-                            
-                            action = {
-                                "_op_type": "update",
-                                "_index": index_name,
-                                "_id": doc_id,
-                                "doc": {
-                                    "Score": new_score,
-                                    "Severity": new_severity
-                                }
-                            }
-                            actions.append(action)
-                            updated_count += 1
-                        else:
-                            skipped_count += 1 # Already up-to-date
-                    else:
-                        skipped_count += 1 # CVE details not found in list-cve
-
+                    search_response = es.search(
+                        index=index_pattern,
+                        body=query,
+                        from_=current_from,
+                        size=page_size
+                    )
                 except Exception as e:
-                    error_count += 1
-                    log_exception(e, cve_id, doc_id)
-                finally:
-                    pbar.update(1)
+                    print(f"\n[!] Failed to fetch page at offset {current_from}. Error: {e}")
+                    print("[*] Retrying in 10 seconds...")
+                    time.sleep(10)
+                    continue
 
-        # Perform bulk update if there are actions to be taken
-        if actions:
-            print(f"\n[*] Found {len(actions)} documents to update. Performing bulk update...")
-            success, failed = bulk(es, actions, raise_on_error=False, raise_on_exception=False)
-            print(f"[*] Bulk update complete. Success: {success}, Failed: {len(failed)}")
-            if failed:
-                print(f"[!] Check resync_error_log.txt for details on failed updates.")
-                with open("resync_error_log.txt", "a") as f:
-                    f.write("\n--- BULK UPDATE FAILURES ---\n")
-                    for item in failed:
-                        f.write(f"{item}\n")
+                hits = search_response['hits']['hits']
+                if not hits:
+                    # Should not happen if total_docs > 0, but as a safeguard
+                    break
+
+                for doc in hits:
+                    try:
+                        doc_id = doc['_id']
+                        index_name = doc['_index']
+                        cve_id = doc['_source'].get('Vuln')
+
+                        if not cve_id:
+                            skipped_count += 1
+                            continue
+
+                        new_score, new_severity = get_cve_details(es, cve_id)
+
+                        if new_score is not None and new_severity is not None:
+                            if (doc['_source'].get('Score') != new_score or
+                                doc['_source'].get('Severity') != new_severity):
+                                # Update document one by one
+                                es.update(index=index_name, id=doc_id, body={"doc": {"Score": new_score, "Severity": new_severity}})
+                                updated_count += 1
+                            else:
+                                skipped_count += 1  # Already up-to-date
+                        else:
+                            skipped_count += 1  # CVE details not found
+
+                    except Exception as e:
+                        error_count += 1
+                        log_exception(e, doc.get('_source', {}).get('Vuln', 'N/A'), doc.get('_id', 'N/A'))
+                    finally:
+                        pbar.update(1)
+
+                current_from += len(hits)
 
     except Exception as e:
         print(f"\n[!] An unexpected error occurred: {e}")
