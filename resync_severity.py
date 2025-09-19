@@ -114,31 +114,91 @@ def main():
     current_from = 0
 
     try:
-        print("[*] Starting to process documents page by page...")
-        with tqdm(desc="Processing documents", unit=" docs") as pbar:
-            while True: # Loop indefinitely until no more documents are found
-                # Fetch one page of results
-                try:
-                    search_response = es.search(
-                        # Using track_total_hits=False is more efficient when we don't need an exact total
-                        track_total_hits=False, 
-                        index=index_pattern,
-                        body=query,
-                        from_=current_from,
-                        size=page_size
-                    )
-                except Exception as e:
-                    print(f"\n[!] Failed to fetch page at offset {current_from}. Error: {e}")
-                    print("[*] Retrying in 10 seconds...")
-                    time.sleep(10)
-                    continue
+        # 1. Get a list of all indices that match the pattern and time range. This is a lightweight operation.
+        print(f"[*] Discovering indices matching pattern '{index_pattern}'...")
+        try:
+            # The 'expand_wildcards' option is crucial here.
+            indices = es.indices.get(index=index_pattern, expand_wildcards="open")
+            target_indices = sorted(list(indices.keys()))
+            print(f"[*] Found {len(target_indices)} indices to process.")
+            if not target_indices:
+                print("[*] No matching indices found. Exiting.")
+                sys.exit(0)
+        except Exception as e:
+            print(f"\n[!] Failed to get indices for pattern '{index_pattern}'. Error: {e}")
+            sys.exit(1)
 
-                hits = search_response['hits']['hits']
-                if not hits:
-                    # No more documents found, we are done.
-                    break
+        # 2. Iterate over each index one by one.
+        for index_name in target_indices:
+            print(f"\n--- Processing Index: {index_name} ---")
+            current_from = 0
+            
+            with tqdm(desc=f"Index {index_name}", unit=" docs") as pbar:
+                while True: # Loop for pagination within this single index
+                    # Fetch one page of results from the current index
+                    try:
+                        search_response = es.search(
+                            track_total_hits=False, 
+                            index=index_name,  # IMPORTANT: Use the specific index name
+                            body=query,
+                            from_=current_from,
+                            size=page_size
+                        )
+                    except Exception as e:
+                        print(f"\n[!] Failed to fetch page for index {index_name} at offset {current_from}. Error: {e}")
+                        print("[*] Retrying in 10 seconds...")
+                        time.sleep(10)
+                        continue
 
-                for doc in hits:
+                    hits = search_response['hits']['hits']
+                    if not hits:
+                        # No more documents in this index, move to the next one.
+                        break
+
+                    for doc in hits:
+                        try:
+                            doc_id = doc['_id']
+                            cve_id = doc['_source'].get('Vuln')
+
+                            if not cve_id:
+                                skipped_count += 1
+                                continue
+
+                            new_score, new_severity = get_cve_details(es, cve_id)
+
+                            if new_score is not None and new_severity is not None:
+                                if (doc['_source'].get('Score') != new_score or
+                                    doc['_source'].get('Severity') != new_severity):
+                                    es.update(index=index_name, id=doc_id, body={"doc": {"Score": new_score, "Severity": new_severity}})
+                                    updated_count += 1
+                                else:
+                                    skipped_count += 1  # Already up-to-date
+                            else:
+                                skipped_count += 1  # CVE details not found
+
+                        except Exception as e:
+                            error_count += 1
+                            log_exception(e, doc.get('_source', {}).get('Vuln', 'N/A'), doc.get('_id', 'N/A'))
+                        finally:
+                            pbar.update(1)
+
+                    current_from += len(hits)
+
+    except KeyboardInterrupt:
+        print("\n[!] Process interrupted by user.")
+    except Exception as e:
+        print(f"\n[!] An unexpected error occurred during the main loop: {e}")
+        traceback.print_exc()
+
+    # --- Final Summary ---
+    print("\n--- Resync Summary ---")
+    print(f"Documents Updated: {updated_count}")
+    print(f"Documents Skipped (no change, no CVE ID, or not found): {skipped_count}")
+    print(f"Errors during processing: {error_count}")
+    print("======================")
+
+if __name__ == "__main__":
+    main()
                     try:
                         doc_id = doc['_id']
                         index_name = doc['_index']
