@@ -78,7 +78,13 @@ def main():
 
     # --- Initialization ---
     url_elastic = "http://admin:admin123@10.12.20.213:9200"
-    es = Elasticsearch([url_elastic], verify_certs=False, request_timeout=60)
+    es = Elasticsearch(
+        [url_elastic], 
+        verify_certs=False, 
+        request_timeout=60,
+        retry_on_timeout=True, # Automatically retry on timeout
+        max_retries=3          # Retry up to 3 times
+    )
 
     print(f"[*] Starting resync process...")
     print(f"[*] Index Pattern: {index_pattern}")
@@ -115,17 +121,10 @@ def main():
     error_count = 0
 
     try:
-        # Use scan helper to efficiently scroll through all results
-        # First, get the total count for the progress bar
-        total_docs = es.count(index=index_pattern, body=query)['count']
-        print(f"[*] Found {total_docs} documents to process.")
-
-        if total_docs == 0:
-            print("[*] No documents found in the specified time range. Exiting.")
-            sys.exit(0)
-
+        print("[*] Scanning for documents to process... (Total count is omitted for stability)")
         # Process documents with a progress bar
-        with tqdm(total=total_docs, desc="Processing documents") as pbar:
+        # We don't know the total, so the progress bar will show iteration count
+        with tqdm(desc="Processing documents", unit=" docs") as pbar:
             for doc in scan(es, index=index_pattern, query=query):
                 try:
                     doc_id = doc['_id']
