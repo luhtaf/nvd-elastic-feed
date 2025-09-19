@@ -199,39 +199,34 @@ def main():
 
 if __name__ == "__main__":
     main()
-                    try:
-                        doc_id = doc['_id']
-                        index_name = doc['_index']
-                        cve_id = doc['_source'].get('Vuln')
+        try:
+            doc_id = doc['_id']
+            index_name = doc['_index']
+            cve_id = doc['_source'].get('Vuln')
 
-                        if not cve_id:
-                            skipped_count += 1
-                            continue
+            if not cve_id:
+                skipped_count += 1
+                continue
 
-                        new_score, new_severity = get_cve_details(es, cve_id)
+            new_score, new_severity = get_cve_details(es, cve_id)
 
-                        if new_score is not None and new_severity is not None:
-                            if (doc['_source'].get('Score') != new_score or
-                                doc['_source'].get('Severity') != new_severity):
-                                es.update(index=index_name, id=doc_id, body={"doc": {"Score": new_score, "Severity": new_severity}})
-                                updated_count += 1
-                            else:
-                                skipped_count += 1  # Already up-to-date
-                        else:
-                            skipped_count += 1  # CVE details not found
+            if new_score is not None and new_severity is not None:
+                if (doc['_source'].get('Score') != new_score or
+                    doc['_source'].get('Severity') != new_severity):
+                    es.update(index=index_name, id=doc_id, body={"doc": {"Score": new_score, "Severity": new_severity}})
+                    updated_count += 1
+                else:
+                    skipped_count += 1  # Already up-to-date
+            else:
+                skipped_count += 1  # CVE details not found
 
-                    except Exception as e:
-                        error_count += 1
-                        log_exception(e, doc.get('_source', {}).get('Vuln', 'N/A'), doc.get('_id', 'N/A'))
-                    finally:
-                        pbar.update(1)
+        except Exception as e:
+            error_count += 1
+            log_exception(e, doc.get('_source', {}).get('Vuln', 'N/A'), doc.get('_id', 'N/A'))
+        finally:
+            pbar.update(1)
 
-                current_from += len(hits)
-
-    except Exception as e:
-        # This will catch the initial ConnectionError if it happens on the first search
-        print(f"\n[!] An unexpected error occurred: {e}")
-        traceback.print_exc()
+    current_from += len(hits)
 
     # --- Final Summary ---
     print("\n--- Resync Summary ---")
