@@ -1,24 +1,9 @@
 import sys
-import yaml
 import traceback
 from datetime import datetime
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan, bulk
 from tqdm import tqdm
-
-def load_config():
-    """
-    Load configuration from config.yaml
-    """
-    try:
-        with open('config.yaml', 'r') as config_file:
-            return yaml.safe_load(config_file)
-    except FileNotFoundError:
-        print("Error: Configuration file 'config.yaml' not found. Please create it.")
-        sys.exit(1)
-    except yaml.YAMLError as e:
-        print(f"Error parsing configuration file: {e}")
-        sys.exit(1)
 
 def log_exception(e, cve_id, doc_id, filename="resync_error_log.txt"):
     """Logs an exception to a file."""
@@ -80,10 +65,13 @@ def main():
     url_elastic = "http://admin:admin123@10.12.20.213:9200"
     es = Elasticsearch(
         [url_elastic], 
-        verify_certs=False, 
-        request_timeout=60,
-        retry_on_timeout=True, # Automatically retry on timeout
-        max_retries=3          # Retry up to 3 times
+        verify_certs=False,
+        request_timeout=120,      # Increase timeout to 2 minutes
+        retry_on_timeout=True,    # Automatically retry on timeout
+        max_retries=5,            # Increase retries
+        sniff_on_start=False,     # Disable sniffing on start
+        sniff_on_connection_fail=False, # Disable sniffing on fail
+        sniffer_timeout=None      # Disable periodic sniffing
     )
 
     print(f"[*] Starting resync process...")
@@ -130,8 +118,8 @@ def main():
                 client=es, 
                 index=index_pattern, 
                 query=query, 
-                size=100,  # Request smaller batches (default is 1000)
-                scroll='5m' # Keep the scroll context alive for 5 minutes
+                size=50,      # Further reduce batch size
+                scroll='10m'  # Keep the scroll context alive for 10 minutes
             ):
                 try:
                     doc_id = doc['_id']
