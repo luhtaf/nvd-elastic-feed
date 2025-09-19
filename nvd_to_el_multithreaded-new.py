@@ -1,10 +1,9 @@
 import traceback, json, requests, time, threading
-from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from elasticsearch import Elasticsearch
+from queue import Queue
 import signal
 import sys
-import os
 import yaml
 from tqdm import tqdm
 
@@ -24,10 +23,9 @@ def load_config():
 config = load_config()
 url_elastic = config.get('url_elastic', 'http://localhost:9200')
 # Configuration variables
-MAX_CONCURRENT_THREADS = 3  # Lower for update operations
-THREAD_SPAWN_INTERVAL = 5   # Faster for updates
+MAX_CONCURRENT_THREADS = 5
+THREAD_SPAWN_INTERVAL = 10  # seconds
 PER_PAGE = 2000
-UPDATE_WINDOW_HOURS = 24    # Check last 24 hours
 
 # Global variables for thread management
 page_counter = 1
@@ -39,16 +37,7 @@ threads_lock = threading.Lock()
 progress_bars = {}
 progress_lock = threading.Lock()
 
-# Statistics tracking
-stats = {
-    'updated': 0,
-    'added': 0,
-    'errors': 0,
-    'total_processed': 0
-}
-stats_lock = threading.Lock()
-
-def log_exception(e, filename="update_error_log.txt"):
+def log_exception(e, filename="error_log.txt"):
     lineno = e.__traceback__.tb_lineno
     tb_str = traceback.format_exc()
     
@@ -60,55 +49,31 @@ def log_exception(e, filename="update_error_log.txt"):
             f.write("\n\n")
         print(f"[Thread-{threading.current_thread().name}] [!] Exception di line {lineno}, lihat {filename}")
 
-def get_time_range():
-    """Get the time range for the last 24 hours in ISO-8601 format"""
-    end_time = datetime.utcnow()
-    start_time = end_time - timedelta(hours=UPDATE_WINDOW_HOURS)
-    
-    # Format as ISO-8601 with Z suffix for UTC
-    start_date = start_time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    end_date = end_time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    
-    return start_date, end_date
-
-template_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+template_url = "https://services.nvd.nist.gov/rest/json/cves/2.0?startIndex=<halaman>"
 template_index = "list-cve-<tahun>"
 es = Elasticsearch(url_elastic, verify_certs=False)
 
-def check_cve_exists(cve_id):
-    """Check if CVE already exists in Elasticsearch and get its lastModified date"""
-    try:
-        tahun = cve_id.split('-')[1]
-        index = template_index.replace("<tahun>", tahun)
-        
-        response = es.get(index=index, id=cve_id, _source=['lastModified'])
-        return True, response['_source']['lastModified']
-    except Exception:
-        return False, None
-
-def process_per_page(page, start_date, end_date, perPage=PER_PAGE):
-    """Process a single page of updated CVE data with progress bar"""
+def process_per_page(page, perPage=PER_PAGE):
+    """Process a single page of CVE data - thread-safe version with progress bar"""
     thread_name = threading.current_thread().name
     offset = (page-1) * perPage
-    
-    # Build URL with lastModStartDate and lastModEndDate parameters
-    url = f"{template_url}?startIndex={offset}&resultsPerPage={perPage}&lastModStartDate={start_date}&lastModEndDate={end_date}"
+    url = template_url.replace("<halaman>", str(offset))
     
     # Create progress bar for this thread
     with progress_lock:
-        pbar = tqdm(total=perPage, desc=f"Update-Thread-{thread_name[-1]} Page-{page}", 
+        pbar = tqdm(total=perPage, desc=f"Thread-{thread_name[-1]} Page-{page}", 
                    position=len(progress_bars), leave=True, 
                    bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
         progress_bars[thread_name] = pbar
     
     try:
-        pbar.set_description(f"Update-Thread-{thread_name[-1]} Page-{page} [Fetching Updates]")
+        pbar.set_description(f"Thread-{thread_name[-1]} Page-{page} [Fetching API]")
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         data = response.json()
     except Exception as e:
         log_exception(e)
-        pbar.set_description(f"Update-Thread-{thread_name[-1]} Page-{page} [FAILED]")
+        pbar.set_description(f"Thread-{thread_name[-1]} Page-{page} [FAILED]")
         pbar.close()
         with progress_lock:
             del progress_bars[thread_name]
@@ -116,9 +81,6 @@ def process_per_page(page, start_date, end_date, perPage=PER_PAGE):
 
     vulnerabilities = data.get('vulnerabilities', [])
     processed_count = 0
-    updated_count = 0
-    added_count = 0
-    error_count = 0
     total_vulns = len(vulnerabilities)
     
     # Update progress bar total to actual number of vulnerabilities
@@ -128,23 +90,6 @@ def process_per_page(page, start_date, end_date, perPage=PER_PAGE):
     for i, vuln in enumerate(vulnerabilities):
         try:
             _id = vuln['cve']['id']
-            cve_last_modified = vuln['cve']['lastModified']
-            
-            # Check if CVE exists and compare lastModified dates
-            exists, existing_last_modified = check_cve_exists(_id)
-            
-            # Determine if this is an update or new addition
-            is_update = False
-            if exists:
-                if existing_last_modified != cve_last_modified:
-                    is_update = True
-                else:
-                    # Skip if no changes
-                    pbar.update(1)
-                    pbar.set_description(f"Update-Thread-{thread_name[-1]} Page-{page} [Skipped: {_id}]")
-                    continue
-            
-            # Process CVE data (same as original script)
             newData = {
                 "desc": vuln['cve']["descriptions"][0]['value'],
                 "published": vuln['cve']['published'],
@@ -209,39 +154,24 @@ def process_per_page(page, start_date, end_date, perPage=PER_PAGE):
             except Exception as e:
                 log_exception(e)
 
-            # Index to Elasticsearch
+            # bikin index dari tahun CVE
             tahun = _id.split('-')[1]
             index = template_index.replace("<tahun>", tahun)
 
             res = es.index(index=index, body=newData, id=_id)
             processed_count += 1
             
-            if is_update:
-                updated_count += 1
-                action = "UPDATED"
-            else:
-                added_count += 1
-                action = "ADDED"
-            
             # Update progress bar
             pbar.update(1)
-            pbar.set_description(f"Update-Thread-{thread_name[-1]} Page-{page} [{action}: {_id}]")
+            pbar.set_description(f"Thread-{thread_name[-1]} Page-{page} [Processing: {_id}]")
             
         except Exception as e:
             log_exception(e)
-            error_count += 1
             pbar.update(1)
             continue
     
-    # Update global statistics
-    with stats_lock:
-        stats['updated'] += updated_count
-        stats['added'] += added_count
-        stats['errors'] += error_count
-        stats['total_processed'] += processed_count
-    
     # Complete progress bar
-    pbar.set_description(f"Update-Thread-{thread_name[-1]} Page-{page} [DONE: +{added_count} ~{updated_count} !{error_count}]")
+    pbar.set_description(f"Thread-{thread_name[-1]} Page-{page} [COMPLETED - {processed_count} CVEs]")
     pbar.close()
     
     # Remove from active progress bars
@@ -266,8 +196,8 @@ def get_next_page():
         page_counter += 1
         return current_page
 
-def worker_thread(start_date, end_date):
-    """Worker function that processes a single page of updates"""
+def worker_thread():
+    """Worker function that processes a single page"""
     global total_results, active_threads
     
     # Get next page to process
@@ -281,14 +211,14 @@ def worker_thread(start_date, end_date):
     
     try:
         # Process the page
-        data = process_per_page(page, start_date, end_date)
+        data = process_per_page(page)
         
         # Update total_results if this is the first successful response
         if data and total_results is None:
             with page_lock:
                 if total_results is None:  # Double-check after acquiring lock
                     total_results = data.get("totalResults", 0)
-                    print(f"[MAIN] Total updated CVEs detected: {total_results}")
+                    print(f"[MAIN] Total results detected: {total_results}")
         
     except Exception as e:
         log_exception(e)
@@ -311,64 +241,6 @@ def signal_handler(signum, frame):
     cleanup_progress_bars()
     shutdown_event.set()
 
-def write_statistics_to_file(start_date, end_date, start_time, end_time):
-    """Write statistics to timestamped log file"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"update_log_{timestamp}.txt"
-    
-    duration = end_time - start_time
-    duration_str = str(duration).split('.')[0]  # Remove microseconds
-    
-    log_content = f"""
-NVD CVE UPDATE LOG
-==================
-Timestamp: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-Update Window: {UPDATE_WINDOW_HOURS} hours
-Time Range: {start_date} to {end_date}
-Duration: {duration_str}
-
-CONFIGURATION
-=============
-Max Concurrent Threads: {MAX_CONCURRENT_THREADS}
-Thread Spawn Interval: {THREAD_SPAWN_INTERVAL} seconds
-Records Per Page: {PER_PAGE}
-
-STATISTICS
-==========
-Total CVEs Processed: {stats['total_processed']}
-New CVEs Added: {stats['added']}
-Existing CVEs Updated: {stats['updated']}
-Errors Encountered: {stats['errors']}
-
-SUMMARY
-=======
-Total Changes: {stats['added'] + stats['updated']}
-Success Rate: {((stats['total_processed'] - stats['errors']) / max(stats['total_processed'], 1) * 100):.1f}%
-
-==================
-"""
-    
-    try:
-        with open(log_filename, 'w') as f:
-            f.write(log_content)
-        print(f"[MAIN] Statistics written to: {log_filename}")
-        return log_filename
-    except Exception as e:
-        print(f"[MAIN] Failed to write log file: {e}")
-        return None
-
-def print_statistics():
-    """Print final statistics"""
-    print("\n" + "="*60)
-    print("UPDATE STATISTICS")
-    print("="*60)
-    print(f"Total CVEs Processed: {stats['total_processed']}")
-    print(f"New CVEs Added: {stats['added']}")
-    print(f"Existing CVEs Updated: {stats['updated']}")
-    print(f"Errors Encountered: {stats['errors']}")
-    print(f"Success Rate: {((stats['total_processed'] - stats['errors']) / max(stats['total_processed'], 1) * 100):.1f}%")
-    print("="*60)
-
 def main():
     global active_threads
     
@@ -376,15 +248,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Record start time
-    start_time = datetime.now()
-    
-    # Get time range for last 24 hours
-    start_date, end_date = get_time_range()
-    
-    print(f"[MAIN] Starting NVD CVE Update Process")
-    print(f"[MAIN] Time Range: {start_date} to {end_date}")
-    print(f"[MAIN] Update Window: {UPDATE_WINDOW_HOURS} hours")
+    print(f"[MAIN] Starting multi-threaded NVD to Elasticsearch sync")
     print(f"[MAIN] Max concurrent threads: {MAX_CONCURRENT_THREADS}")
     print(f"[MAIN] Thread spawn interval: {THREAD_SPAWN_INTERVAL} seconds")
     print(f"[MAIN] Records per page: {PER_PAGE}")
@@ -398,14 +262,14 @@ def main():
             if total_results is not None:
                 start_index = (page_counter - 1) * PER_PAGE
                 if start_index >= total_results:
-                    print(f"[MAIN] ✅ All updated CVEs processed. Total: {total_results}")
+                    print(f"[MAIN] ✅ All data processed. Total results: {total_results}")
                     break
             
             # Submit new worker if we have capacity
             if len(futures) < MAX_CONCURRENT_THREADS:
-                future = executor.submit(worker_thread, start_date, end_date)
+                future = executor.submit(worker_thread)
                 futures.append(future)
-                print(f"[MAIN] Started update thread for page {page_counter-1}. Active threads: {len(futures)}")
+                print(f"[MAIN] Started thread for page {page_counter-1}. Active threads: {len(futures)}")
             
             # Clean up completed futures
             completed_futures = []
@@ -434,19 +298,9 @@ def main():
             except Exception as e:
                 log_exception(e)
     
-    # Record end time
-    end_time = datetime.now()
-    
     # Final cleanup of any remaining progress bars
     cleanup_progress_bars()
-    
-    # Print statistics
-    print_statistics()
-    
-    # Write statistics to timestamped log file
-    write_statistics_to_file(start_date, end_date, start_time, end_time)
-    
-    print("[MAIN] ✅ CVE update process completed.")
+    print("[MAIN] ✅ All threads completed. Exiting.")
 
 if __name__ == "__main__":
     main()
