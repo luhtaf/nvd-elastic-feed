@@ -3,7 +3,6 @@ import traceback
 import time
 from datetime import datetime
 from elasticsearch import Elasticsearch, NotFoundError
-from elasticsearch.helpers import bulk
 from tqdm import tqdm
 
 def log_exception(e, cve_id, doc_id, filename="resync_error_log.txt"):
@@ -139,7 +138,6 @@ def main():
                     # No more documents found, we are done.
                     break
 
-                actions_for_bulk = []
                 for doc in hits:
                     try:
                         doc_id = doc['_id']
@@ -155,16 +153,8 @@ def main():
                         if new_score is not None and new_severity is not None:
                             if (doc['_source'].get('Score') != new_score or
                                 doc['_source'].get('Severity') != new_severity):
-                                # Prepare action for bulk update
-                                actions_for_bulk.append({
-                                    "_op_type": "update",
-                                    "_index": index_name,
-                                    "_id": doc_id,
-                                    "doc": {
-                                        "Score": new_score,
-                                        "Severity": new_severity
-                                    }
-                                })
+                                es.update(index=index_name, id=doc_id, body={"doc": {"Score": new_score, "Severity": new_severity}})
+                                updated_count += 1
                             else:
                                 skipped_count += 1  # Already up-to-date
                         else:
@@ -177,18 +167,6 @@ def main():
                         pbar.update(1)
 
                 current_from += len(hits)
-
-                # Perform bulk update for the current page if there are actions
-                if actions_for_bulk:
-                    try:
-                        success, _ = bulk(es, actions_for_bulk, raise_on_error=True)
-                        updated_count += success
-                    except Exception as e:
-                        print(f"\n[!] Bulk update for page failed. See log for details. Error: {e}")
-                        # Log each failed action
-                        for action in actions_for_bulk:
-                            log_exception(e, action.get('doc', {}).get('Vuln', 'N/A'), action.get('_id', 'N/A'))
-                            error_count += 1
 
     except Exception as e:
         # This will catch the initial ConnectionError if it happens on the first search
