@@ -125,7 +125,14 @@ def main():
         # Process documents with a progress bar
         # We don't know the total, so the progress bar will show iteration count
         with tqdm(desc="Processing documents", unit=" docs") as pbar:
-            for doc in scan(es, index=index_pattern, query=query):
+            # Use scan with smaller batch size and longer scroll time for stability
+            for doc in scan(
+                client=es, 
+                index=index_pattern, 
+                query=query, 
+                size=100,  # Request smaller batches (default is 1000)
+                scroll='5m' # Keep the scroll context alive for 5 minutes
+            ):
                 try:
                     doc_id = doc['_id']
                     index_name = doc['_index']
