@@ -1,9 +1,14 @@
 import sys
 import traceback
 import time
+import warnings
 from datetime import datetime
 from elasticsearch import Elasticsearch, NotFoundError
 from tqdm import tqdm
+from elasticsearch.helpers import scan, bulk
+
+# Suppress SSL warnings
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 def log_exception(e, cve_id, doc_id, filename="resync_error_log.txt"):
     """Logs an exception to a file."""
@@ -66,17 +71,41 @@ def main():
         sys.exit(1)
 
     # --- Initialization ---
-    url_elastic = "http://admin:admin123@10.12.20.213:9200"
+    url_elastic = "https://admin:admin123@10.12.20.213:9200"
     es = Elasticsearch(
         [url_elastic], 
         verify_certs=False, 
-        request_timeout=60,       # Back to 60s, as requests are smaller
+        request_timeout=120,      # Increased timeout to 120s
         retry_on_timeout=True,    # Automatically retry on timeout
-        max_retries=3,
+        max_retries=5,            # Increased retries
         sniff_on_start=False,     # Disable sniffing on start
         sniff_on_connection_fail=False, # Disable sniffing on fail
-        sniffer_timeout=None
+        sniffer_timeout=None,
+        http_compress=True,       # Enable compression
+        timeout=30                # Connection timeout
     )
+    
+    # Test connection first
+    print(f"[*] Testing connection to Elasticsearch...")
+    try:
+        # Simple ping test
+        if not es.ping():
+            print("[!] Elasticsearch is not responding to ping")
+            sys.exit(1)
+        
+        # Get cluster info
+        cluster_info = es.info()
+        print(f"[*] Connected to Elasticsearch cluster: {cluster_info.get('cluster_name', 'Unknown')}")
+        print(f"[*] Elasticsearch version: {cluster_info.get('version', {}).get('number', 'Unknown')}")
+        
+    except Exception as e:
+        print(f"[!] Failed to connect to Elasticsearch: {e}")
+        print(f"[!] Please check:")
+        print(f"    - Elasticsearch server is running")
+        print(f"    - URL is correct: {url_elastic}")
+        print(f"    - Network connectivity")
+        print(f"    - Authentication credentials")
+        sys.exit(1)
 
     print(f"[*] Starting resync process...")
     print(f"[*] Index Pattern: {index_pattern}")
@@ -110,11 +139,11 @@ def main():
     updated_count = 0
     skipped_count = 0
     error_count = 0
-    page_size = 10  # Process 10 documents at a time (very small)
-    current_from = 0
+    actions_for_bulk = []
+    BULK_BATCH_SIZE = 500 # How many updates to send in one bulk request
 
     try:
-        # 1. Get a list of all indices that match the pattern. This is a lightweight operation.
+        # Get the total count for the progress bar
         print(f"[*] Discovering indices matching pattern '{index_pattern}'...")
         try:
             # The 'expand_wildcards' option is crucial here.
@@ -122,67 +151,63 @@ def main():
             target_indices = sorted(list(indices.keys()))
             print(f"[*] Found {len(target_indices)} indices to process.")
             if not target_indices:
-                print("[*] No matching indices found. Exiting.")
+                print("[*] No documents found in the specified time range. Exiting.")
                 sys.exit(0)
+            
+            total_docs = es.count(index=index_pattern, body=query)['count']
+            print(f"[*] Found {total_docs} documents to process.")
+
         except Exception as e:
             print(f"\n[!] Failed to get indices for pattern '{index_pattern}'. Error: {e}")
             sys.exit(1)
 
-        # 2. Iterate over each index one by one.
-        for index_name in target_indices:
-            print(f"\n--- Processing Index: {index_name} ---")
-            current_from = 0
-            
-            with tqdm(desc=f"Index {index_name}", unit=" docs") as pbar:
-                while True: # Loop for pagination within this single index
-                    # Fetch one page of results from the current index
-                    try:
-                        search_response = es.search(
-                            track_total_hits=False, 
-                            index=index_name,  # IMPORTANT: Use the specific index name
-                            body=query,
-                            from_=current_from,
-                            size=page_size
-                        )
-                    except Exception as e:
-                        print(f"\n[!] Failed to fetch page for index {index_name} at offset {current_from}. Error: {e}")
-                        print("[*] Retrying in 10 seconds...")
-                        time.sleep(10)
+        # Use scan helper to efficiently scroll through all results
+        with tqdm(total=total_docs, desc="Processing documents", unit=" docs") as pbar:
+            for doc in scan(es, index=index_pattern, query=query, size=500, scroll='5m'):
+                try:
+                    doc_id = doc['_id']
+                    index_name = doc['_index']
+                    cve_id = doc['_source'].get('Vuln')
+
+                    if not cve_id:
+                        skipped_count += 1
+                        pbar.update(1)
                         continue
 
-                    hits = search_response['hits']['hits']
-                    if not hits:
-                        # No more documents in this index, move to the next one.
-                        break
+                    new_score, new_severity = get_cve_details(es, cve_id)
 
-                    for doc in hits:
-                        try:
-                            doc_id = doc['_id']
-                            cve_id = doc['_source'].get('Vuln')
+                    if new_score is not None and new_severity is not None:
+                        if (doc['_source'].get('Score') != new_score or
+                            doc['_source'].get('Severity') != new_severity):
+                            
+                            action = {
+                                "_op_type": "update",
+                                "_index": index_name,
+                                "_id": doc_id,
+                                "doc": {"Score": new_score, "Severity": new_severity}
+                            }
+                            actions_for_bulk.append(action)
+                        else:
+                            skipped_count += 1  # Already up-to-date
+                    else:
+                        skipped_count += 1  # CVE details not found
 
-                            if not cve_id:
-                                skipped_count += 1
-                                continue
+                    # Perform bulk update when batch size is reached
+                    if len(actions_for_bulk) >= BULK_BATCH_SIZE:
+                        success, _ = bulk(es, actions_for_bulk, raise_on_error=True)
+                        updated_count += success
+                        actions_for_bulk = [] # Reset batch
 
-                            new_score, new_severity = get_cve_details(es, cve_id)
+                except Exception as e:
+                    error_count += 1
+                    log_exception(e, doc.get('_source', {}).get('Vuln', 'N/A'), doc.get('_id', 'N/A'))
+                finally:
+                    pbar.update(1)
 
-                            if new_score is not None and new_severity is not None:
-                                if (doc['_source'].get('Score') != new_score or
-                                    doc['_source'].get('Severity') != new_severity):
-                                    es.update(index=index_name, id=doc_id, body={"doc": {"Score": new_score, "Severity": new_severity}})
-                                    updated_count += 1
-                                else:
-                                    skipped_count += 1  # Already up-to-date
-                            else:
-                                skipped_count += 1  # CVE details not found
-
-                        except Exception as e:
-                            error_count += 1
-                            log_exception(e, doc.get('_source', {}).get('Vuln', 'N/A'), doc.get('_id', 'N/A'))
-                        finally:
-                            pbar.update(1)
-
-                    current_from += len(hits)
+        # Perform final bulk update for any remaining actions
+        if actions_for_bulk:
+            success, _ = bulk(es, actions_for_bulk, raise_on_error=True)
+            updated_count += success
 
     except KeyboardInterrupt:
         print("\n[!] Process interrupted by user.")
